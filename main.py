@@ -50,17 +50,32 @@ def save_checkpoint(
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# Trait d'union ASCII plus les tirets Unicode courants (tiret demi-cadratin,
+# cadratin, insécable, etc.), fréquents dans les noms de fichiers macOS.
+_DASHES = r"\-‐‑‒–—―"
+
+
 def clean_title(path: Path) -> str:
     """
-    Convertit des noms de fichier (ou de dossier) comme :
+    Convertit des noms de fichier ou de dossier comme :
       01_contract-final.pdf
+      02_Comptes–annuels 2025   (tiret Unicode, dossier)
 
     en :
       Contract Final
+      Comptes Annuels 2025
+
+    On ne retire que l'extension « .pdf » : le point est significatif dans un
+    nom de dossier (« v1.2 ») et ne doit pas tronquer le nom.
     """
-    name = path.stem
-    name = re.sub(r"^\d+[_\-. ]*", "", name)
-    name = name.replace("_", " ").replace("-", " ")
+    name = path.name
+    if name.lower().endswith(".pdf"):
+        name = name[: -len(".pdf")]
+    # Préfixe numérique de tri : « 01_ », « 1- », « 1. »…
+    name = re.sub(rf"^\d+[_{_DASHES}. ]*", "", name)
+    # Underscores et tirets (ASCII + Unicode) → espaces.
+    name = re.sub(rf"[_{_DASHES}]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
     return name.title()
 
 
