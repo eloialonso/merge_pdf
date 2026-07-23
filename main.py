@@ -784,8 +784,32 @@ def create_merged_pdf():
             f"(attendu {expected_total_pages}, obtenu {len(verify.pages)})."
         )
 
+    n_section_pages = sum(
+        1 for b in section_blocks if b["divider_page_index"] is not None
+    )
+    all_docs = unsectioned_docs + [d for b in section_blocks for d in b["docs"]]
+    n_title_pages = len(all_docs) if include_title_pages else 0
+    n_content = sum(d["page_count"] for d in all_docs)
+
     print()
     print(f"Créé : {OUTPUT_FILE.resolve()}")
+    print()
+    print("Options appliquées :")
+    print(
+        f"- Pages de séparation de section : "
+        f"{'OUI' if section_dividers else 'NON'} ({n_section_pages} page(s))"
+    )
+    print(
+        f"- Pages de titre d'annexe : "
+        f"{'OUI' if include_title_pages else 'NON'} ({n_title_pages} page(s))"
+    )
+    print(f"- Suppression des pages de garde : {'OUI' if remove_cover else 'NON'}")
+    print(f"- Sections détectées : {len(section_blocks)}")
+    print(
+        f"Total : {len(verify.pages)} pages = "
+        f"{main_page_count} document + {toc_page_count} table + "
+        f"{n_section_pages} séparation + {n_title_pages} titre + {n_content} contenu"
+    )
     print()
     print(f"Document principal : {main_path.name} ({main_page_count} pages)")
 
