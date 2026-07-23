@@ -4,6 +4,7 @@ import json
 import math
 import re
 
+import pypdf
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
 from pypdf.generic import ArrayObject, FloatObject
@@ -17,6 +18,27 @@ OUTPUT_FILE = Path("merged_with_toc.pdf")
 CHECKPOINT_FILE = Path("merge_pdf_checkpoint.json")
 PAGE_SIZE = A4
 TITLE = "Table des annexes"
+
+# Les versions plus anciennes de pypdf perdent silencieusement des pages sur
+# certains PDF (notamment des scans exportés sous macOS). On recommande donc
+# au minimum cette version, celle épinglée dans pyproject.toml.
+MIN_PYPDF = (6, 10, 2)
+
+
+def check_pypdf_version() -> None:
+    raw = getattr(pypdf, "__version__", "0")
+    try:
+        parts = tuple(int(x) for x in raw.split(".")[:3])
+    except ValueError:
+        return
+    if parts < MIN_PYPDF:
+        print(
+            f"⚠️  pypdf {raw} détecté — version {'.'.join(map(str, MIN_PYPDF))} "
+            "ou plus récente recommandée.\n"
+            "    Les versions plus anciennes peuvent perdre des pages sur "
+            "certains PDF (scans macOS).\n"
+            "    Lancez de préférence « uv run python main.py ».\n"
+        )
 
 
 def load_checkpoint() -> dict:
@@ -38,6 +60,7 @@ def save_checkpoint(
     section_names: dict[str, str],
     remove_cover: bool,
     section_dividers: bool,
+    include_title_pages: bool,
 ) -> None:
     data = {
         "main": main_path.name,
@@ -45,6 +68,7 @@ def save_checkpoint(
         "section_names": section_names,
         "remove_cover": remove_cover,
         "section_dividers": section_dividers,
+        "include_title_pages": include_title_pages,
     }
     with CHECKPOINT_FILE.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -482,6 +506,8 @@ def build_doc(spec: dict, remove_cover: bool) -> dict:
 
 
 def create_merged_pdf():
+    check_pypdf_version()
+
     if not INPUT_DIR.exists():
         raise FileNotFoundError(f"Dossier introuvable : {INPUT_DIR.resolve()}")
 
@@ -499,6 +525,7 @@ def create_merged_pdf():
     saved_section_names = checkpoint.get("section_names", {})
     saved_remove_cover = bool(checkpoint.get("remove_cover", False))
     saved_section_dividers = bool(checkpoint.get("section_dividers", False))
+    saved_include_title_pages = bool(checkpoint.get("include_title_pages", True))
 
     main_index = prompt_main_choice(root_pdfs, default_name=saved_main)
     main_path = root_pdfs[main_index]
@@ -538,12 +565,18 @@ def create_merged_pdf():
             default=saved_section_dividers,
         )
 
+    include_title_pages = prompt_yes_no(
+        "Insérer une page de titre avant chaque annexe ?",
+        default=saved_include_title_pages,
+    )
+
     save_checkpoint(
         main_path,
         {spec["key"]: spec["title"] for spec in specs},
         {section["folder"].name: name for section, name in zip(sections, section_names)},
         remove_cover,
         section_dividers,
+        include_title_pages,
     )
 
     # Lecture des documents.
@@ -591,7 +624,9 @@ def create_merged_pdf():
         target_id = next_target
         next_target += 1
         doc["target_id"] = target_id
-        doc["page_index"] = body_page  # page de titre de l'annexe
+        # Début de l'annexe : sa page de titre si elle existe, sinon sa
+        # première page de contenu.
+        doc["page_index"] = body_page
         target_page_index[target_id] = body_page
         toc_rows.append(
             {
@@ -601,7 +636,8 @@ def create_merged_pdf():
                 "target_id": target_id,
             }
         )
-        body_page += 1 + doc["page_count"]  # page de titre + contenu
+        title_page = 1 if include_title_pages else 0
+        body_page += title_page + doc["page_count"]
 
     for doc in unsectioned_docs:
         place_doc(doc, 0)
@@ -659,13 +695,14 @@ def create_merged_pdf():
     back_links = []
 
     def add_doc_pages(doc):
-        title_page_index = len(writer.pages)
-        assert title_page_index == doc["page_index"], "désynchronisation des pages"
+        start_index = len(writer.pages)
+        assert start_index == doc["page_index"], "désynchronisation des pages"
 
-        title_reader, back_rect = make_title_page(doc["title"])
-        for page in title_reader.pages:
-            writer.add_page(page)
-        back_links.append({"page_index": title_page_index, "rect": back_rect})
+        if include_title_pages:
+            title_reader, back_rect = make_title_page(doc["title"])
+            for page in title_reader.pages:
+                writer.add_page(page)
+            back_links.append({"page_index": start_index, "rect": back_rect})
 
         # Suppression de la page de garde via une plage de pages explicite
         # (plutôt qu'un slice de reader.pages, moins fiable selon les versions).
