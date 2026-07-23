@@ -286,7 +286,12 @@ def make_divider_page(name: str):
 
 
 def read_pdf(path: Path) -> PdfReader:
-    reader = PdfReader(str(path))
+    try:
+        reader = PdfReader(str(path))
+    except Exception as exc:
+        raise RuntimeError(
+            f"PDF illisible (fichier corrompu ?) : {path}"
+        ) from exc
 
     if reader.is_encrypted:
         try:
@@ -297,21 +302,44 @@ def read_pdf(path: Path) -> PdfReader:
     return reader
 
 
+def is_pdf(path: Path) -> bool:
+    # Insensible à la casse (.pdf / .PDF) et sans tenir compte des fichiers
+    # cachés (.DS_Store, etc.).
+    return (
+        path.is_file()
+        and not path.name.startswith(".")
+        and path.suffix.lower() == ".pdf"
+    )
+
+
+def list_pdfs(folder: Path, recursive: bool) -> list[Path]:
+    it = folder.rglob("*") if recursive else folder.iterdir()
+    pdfs = [p for p in it if is_pdf(p)]
+    # Tri par chemin relatif pour un ordre stable (préfixes numériques).
+    return sorted(pdfs, key=lambda p: p.relative_to(folder).as_posix().lower())
+
+
 def discover_inputs(root: Path):
     """
     Retourne (root_pdfs, sections) où :
       root_pdfs : PDF à la racine de pdfs/ (candidats document principal +
                   annexes non classées), triés par nom.
       sections  : liste de dicts {folder, pdfs} pour chaque sous-dossier
-                  contenant au moins un PDF, triés par nom.
+                  contenant au moins un PDF (à n'importe quelle profondeur),
+                  triés par nom.
+
+    La détection est insensible à la casse de l'extension, ignore les fichiers
+    et dossiers cachés, et récupère les PDF placés dans des sous-dossiers
+    imbriqués d'une section (à plat).
     """
-    root_pdfs = sorted(root.glob("*.pdf"), key=lambda p: p.name.lower())
+    root_pdfs = list_pdfs(root, recursive=False)
 
     sections = []
     for folder in sorted(
-        (c for c in root.iterdir() if c.is_dir()), key=lambda p: p.name.lower()
+        (c for c in root.iterdir() if c.is_dir() and not c.name.startswith(".")),
+        key=lambda p: p.name.lower(),
     ):
-        pdfs = sorted(folder.glob("*.pdf"), key=lambda p: p.name.lower())
+        pdfs = list_pdfs(folder, recursive=True)
         if pdfs:
             sections.append({"folder": folder, "pdfs": pdfs})
 
@@ -592,15 +620,20 @@ def create_merged_pdf():
             header_row["target_id"] = first_doc["target_id"]
             block["bookmark_page_index"] = first_doc["page_index"]
 
+    expected_total_pages = body_page  # index de page atteint = nombre total de pages
+
     toc_buffer, link_rects = make_toc_pdf(toc_rows)
     toc_reader = PdfReader(toc_buffer)
 
     writer = PdfWriter()
 
     # 1. Document principal.
+    #    On utilise writer.append() (et non add_page() page par page) : le
+    #    remappage complet du graphe d'objets est bien plus robuste face aux
+    #    PDF mal formés (p. ex. exportés/complétés sous macOS), qui sinon
+    #    peuvent perdre des pages à l'écriture.
     main_start_index = len(writer.pages)
-    for page in main_reader.pages:
-        writer.add_page(page)
+    writer.append(main_reader, import_outline=False)
 
     # 2. Table des annexes.
     toc_start_index = len(writer.pages)
@@ -619,8 +652,15 @@ def create_merged_pdf():
             writer.add_page(page)
         back_links.append({"page_index": title_page_index, "rect": back_rect})
 
-        for page in doc["reader"].pages[doc["start_page"]:]:
-            writer.add_page(page)
+        # Suppression de la page de garde via une plage de pages explicite
+        # (plutôt qu'un slice de reader.pages, moins fiable selon les versions).
+        total_pages = len(doc["reader"].pages)
+        if doc["start_page"] < total_pages:
+            writer.append(
+                doc["reader"],
+                pages=(doc["start_page"], total_pages),
+                import_outline=False,
+            )
 
     for doc in unsectioned_docs:
         add_doc_pages(doc)
@@ -674,8 +714,23 @@ def create_merged_pdf():
             annotation=annotation,
         )
 
+    # Garde-fou : aucune page ne doit être perdue silencieusement.
+    if len(writer.pages) != expected_total_pages:
+        raise RuntimeError(
+            "Incohérence du nombre de pages "
+            f"(attendu {expected_total_pages}, obtenu {len(writer.pages)}). "
+            "Un PDF source est probablement corrompu."
+        )
+
     with OUTPUT_FILE.open("wb") as f:
         writer.write(f)
+
+    verify = PdfReader(str(OUTPUT_FILE))
+    if len(verify.pages) != expected_total_pages:
+        raise RuntimeError(
+            "Le PDF fusionné ne contient pas le nombre de pages attendu "
+            f"(attendu {expected_total_pages}, obtenu {len(verify.pages)})."
+        )
 
     print()
     print(f"Créé : {OUTPUT_FILE.resolve()}")
