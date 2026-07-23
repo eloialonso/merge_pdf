@@ -10,6 +10,6 @@ wheels/
 .venv
 
 # Personal / generated data — do not publish
-pdfs/
+pdfs*/
 merged_with_toc.pdf
 merge_pdf_checkpoint.json
