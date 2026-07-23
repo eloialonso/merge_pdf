@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Personal / generated data — do not publish
+pdfs/
+merged_with_toc.pdf
+merge_pdf_checkpoint.json
