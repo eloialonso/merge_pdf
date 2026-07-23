@@ -55,20 +55,22 @@ def load_checkpoint() -> dict:
 
 
 def save_checkpoint(
-    main_path: Path,
+    main_name: str | None,
     appendix_titles: dict[str, str],
     section_names: dict[str, str],
     remove_cover: bool,
     section_dividers: bool,
     include_title_pages: bool,
+    excluded: set[str],
 ) -> None:
     data = {
-        "main": main_path.name,
+        "main": main_name,
         "titles": appendix_titles,
         "section_names": section_names,
         "remove_cover": remove_cover,
         "section_dividers": section_dividers,
         "include_title_pages": include_title_pages,
+        "excluded": sorted(excluded),
     }
     with CHECKPOINT_FILE.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -417,6 +419,63 @@ def prompt_main_choice(paths: list[Path], default_name: str | None = None) -> in
         print("Réponse invalide, veuillez réessayer.")
 
 
+def prompt_exclusions(
+    all_paths: list[Path],
+    saved_excluded: set[str] | None = None,
+) -> set[str]:
+    """
+    Affiche tous les PDF détectés et demande lesquels EXCLURE de la fusion.
+    Retourne l'ensemble des clés (chemins relatifs) exclues.
+    """
+    saved_excluded = set(saved_excluded or [])
+    if not all_paths:
+        return set()
+
+    print()
+    print("Fichiers PDF détectés :")
+    default_indices = []
+    for i, path in enumerate(all_paths, start=1):
+        key = rel_key(path)
+        previously = key in saved_excluded
+        if previously:
+            default_indices.append(i)
+        marker = "  ← exclu précédemment" if previously else ""
+        print(f"  {i}. {path.relative_to(INPUT_DIR).as_posix()}{marker}")
+
+    if default_indices:
+        default_str = " ".join(str(i) for i in default_indices)
+        prompt_msg = (
+            "Numéros des fichiers à EXCLURE (séparés par des espaces), "
+            f"Entrée pour reprendre l'exclusion précédente ({default_str}), "
+            "« 0 » pour n'en exclure aucun : "
+        )
+    else:
+        prompt_msg = (
+            "Numéros des fichiers à EXCLURE (séparés par des espaces), "
+            "Entrée pour n'en exclure aucun : "
+        )
+
+    while True:
+        answer = input(prompt_msg).strip()
+
+        if answer == "":
+            return {rel_key(all_paths[i - 1]) for i in default_indices}
+        if answer == "0":
+            return set()
+
+        tokens = re.split(r"[\s,]+", answer)
+        try:
+            indices = [int(t) for t in tokens if t]
+        except ValueError:
+            print("Réponse invalide : utilisez uniquement des numéros.")
+            continue
+
+        if all(1 <= n <= len(all_paths) for n in indices):
+            return {rel_key(all_paths[n - 1]) for n in indices}
+
+        print(f"Réponse invalide : indiquez des numéros de 1 à {len(all_paths)}.")
+
+
 def prompt_section_names(
     sections: list[dict],
     saved_names: dict[str, str] | None = None,
@@ -513,10 +572,11 @@ def create_merged_pdf():
 
     root_pdfs, sections = discover_inputs(INPUT_DIR)
 
-    if not root_pdfs:
+    all_paths = list(root_pdfs) + [p for s in sections for p in s["pdfs"]]
+    if not all_paths:
         raise FileNotFoundError(
-            "Aucun PDF à la racine de "
-            f"{INPUT_DIR.resolve()} : placez-y le document principal."
+            f"Aucun PDF trouvé dans {INPUT_DIR.resolve()} "
+            "(ni à la racine, ni dans des sous-dossiers)."
         )
 
     checkpoint = load_checkpoint()
@@ -526,16 +586,38 @@ def create_merged_pdf():
     saved_remove_cover = bool(checkpoint.get("remove_cover", False))
     saved_section_dividers = bool(checkpoint.get("section_dividers", False))
     saved_include_title_pages = bool(checkpoint.get("include_title_pages", True))
+    saved_excluded = set(checkpoint.get("excluded", []))
 
-    main_index = prompt_main_choice(root_pdfs, default_name=saved_main)
-    main_path = root_pdfs[main_index]
+    # Exclusion de fichiers.
+    excluded = prompt_exclusions(all_paths, saved_excluded=saved_excluded)
+    root_pdfs = [p for p in root_pdfs if rel_key(p) not in excluded]
+    sections = [
+        {"folder": s["folder"], "pdfs": [p for p in s["pdfs"] if rel_key(p) not in excluded]}
+        for s in sections
+    ]
+    sections = [s for s in sections if s["pdfs"]]
 
-    unsectioned_paths = [p for i, p in enumerate(root_pdfs) if i != main_index]
+    if not root_pdfs and not sections:
+        raise RuntimeError("Tous les fichiers ont été exclus : rien à fusionner.")
+
+    # Document principal (optionnel) : uniquement choisi parmi les PDF à la
+    # racine. En son absence, le fichier commence par la table des annexes.
+    if root_pdfs:
+        main_index = prompt_main_choice(root_pdfs, default_name=saved_main)
+        main_path = root_pdfs[main_index]
+        unsectioned_paths = [p for i, p in enumerate(root_pdfs) if i != main_index]
+    else:
+        main_path = None
+        unsectioned_paths = []
+        print(
+            "\nAucun PDF à la racine : pas de document principal, "
+            "le fichier commencera par la table des annexes."
+        )
 
     total_appendices = len(unsectioned_paths) + sum(len(s["pdfs"]) for s in sections)
     if total_appendices == 0:
         raise RuntimeError(
-            "Aucune annexe trouvée : ajoutez des PDF à la racine de pdfs/ "
+            "Aucune annexe à fusionner : ajoutez des PDF à la racine de pdfs/ "
             "ou dans des sous-dossiers (sections)."
         )
 
@@ -571,17 +653,18 @@ def create_merged_pdf():
     )
 
     save_checkpoint(
-        main_path,
+        main_path.name if main_path else None,
         {spec["key"]: spec["title"] for spec in specs},
         {section["folder"].name: name for section, name in zip(sections, section_names)},
         remove_cover,
         section_dividers,
         include_title_pages,
+        excluded,
     )
 
     # Lecture des documents.
-    main_reader = read_pdf(main_path)
-    main_page_count = len(main_reader.pages)
+    main_reader = read_pdf(main_path) if main_path else None
+    main_page_count = len(main_reader.pages) if main_reader else 0
 
     key_to_doc = {spec["key"]: build_doc(spec, remove_cover) for spec in specs}
 
@@ -678,13 +761,15 @@ def create_merged_pdf():
 
     writer = PdfWriter()
 
-    # 1. Document principal.
+    # 1. Document principal (optionnel).
     #    On utilise writer.append() (et non add_page() page par page) : le
     #    remappage complet du graphe d'objets est bien plus robuste face aux
     #    PDF mal formés (p. ex. exportés/complétés sous macOS), qui sinon
     #    peuvent perdre des pages à l'écriture.
-    main_start_index = len(writer.pages)
-    writer.append(main_reader, import_outline=False)
+    main_start_index = None
+    if main_reader is not None:
+        main_start_index = len(writer.pages)
+        writer.append(main_reader, import_outline=False)
 
     # 2. Table des annexes.
     toc_start_index = len(writer.pages)
@@ -732,7 +817,8 @@ def create_merged_pdf():
             add_doc_pages(doc)
 
     # Signets (hiérarchiques pour les sections).
-    writer.add_outline_item(clean_title(main_path), main_start_index)
+    if main_path is not None:
+        writer.add_outline_item(clean_title(main_path), main_start_index)
     writer.add_outline_item(TITLE, toc_start_index)
     for doc in unsectioned_docs:
         writer.add_outline_item(doc["title"], doc["page_index"])
@@ -805,13 +891,18 @@ def create_merged_pdf():
     )
     print(f"- Suppression des pages de garde : {'OUI' if remove_cover else 'NON'}")
     print(f"- Sections détectées : {len(section_blocks)}")
+    if excluded:
+        print(f"- Fichiers exclus : {len(excluded)}")
     print(
         f"Total : {len(verify.pages)} pages = "
         f"{main_page_count} document + {toc_page_count} table + "
         f"{n_section_pages} séparation + {n_title_pages} titre + {n_content} contenu"
     )
     print()
-    print(f"Document principal : {main_path.name} ({main_page_count} pages)")
+    if main_path is not None:
+        print(f"Document principal : {main_path.name} ({main_page_count} pages)")
+    else:
+        print("Document principal : aucun (le fichier commence par la table des annexes)")
 
     if unsectioned_docs:
         print()
